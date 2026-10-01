@@ -876,24 +876,38 @@ class Schema(BaseSchema):
             async with extensions_runner.operation():
                 # Note: In graphql-core the schema would be validated here but in
                 # Strawberry we are validating it at initialisation time instead
+                try:
+                    if errors := await self._prepare_operation_async(
+                        execution_context, extensions_runner
+                    ):
+                        return await self._handle_execution_result(
+                            execution_context,
+                            errors,
+                            extensions_runner,
+                        )
 
-                if errors := await self._prepare_operation_async(
-                    execution_context, extensions_runner
+                    assert execution_context.graphql_document
+                    result = await self._execute_operation(
+                        execution_context,
+                        extensions_runner,
+                        middleware_manager,
+                        execute_function,
+                        custom_context_kwargs,
+                    )
+                except (
+                    MissingQueryError,
+                    CannotGetOperationTypeError,
+                    InvalidOperationTypeError,
                 ):
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # Handle the error before the operation hooks unwind, so that
+                    # extensions like MaskErrors can process the result
                     return await self._handle_execution_result(
                         execution_context,
-                        errors,
+                        PreExecutionError(data=None, errors=[_coerce_error(exc)]),
                         extensions_runner,
                     )
-
-                assert execution_context.graphql_document
-                result = await self._execute_operation(
-                    execution_context,
-                    extensions_runner,
-                    middleware_manager,
-                    execute_function,
-                    custom_context_kwargs,
-                )
 
         except (
             MissingQueryError,
@@ -949,64 +963,80 @@ class Schema(BaseSchema):
 
         try:
             with extensions_runner.operation():
-                # Note: In graphql-core the schema would be validated here but in
-                # Strawberry we are validating it at initialisation time instead
-                if (
-                    pre_execution_result := self._prepare_operation_sync(
-                        execution_context, extensions_runner
-                    )
-                ) is not None:
-                    # Match the async path by exposing pre-execution results to
-                    # operation extensions before their hooks unwind.
-                    execution_context.result = pre_execution_result
-                    return pre_execution_result
-
-                assert execution_context.graphql_document is not None
-                with extensions_runner.executing():
-                    if not execution_context.result:
-                        result = execute_function(
-                            self._schema,
-                            execution_context.graphql_document,
-                            root_value=execution_context.root_value,
-                            middleware=middleware_manager,
-                            variable_values=execution_context.variables,
-                            operation_name=execution_context.operation_name,
-                            context_value=execution_context.context,
-                            is_awaitable=optimized_is_awaitable,
-                            **execution_context_class_kwargs(
-                                self.execution_context_class
-                            ),
-                            **custom_context_kwargs,
+                try:
+                    # Note: In graphql-core the schema would be validated here but in
+                    # Strawberry we are validating it at initialisation time instead
+                    if (
+                        pre_execution_result := self._prepare_operation_sync(
+                            execution_context, extensions_runner
                         )
+                    ) is not None:
+                        # Match the async path by exposing pre-execution results to
+                        # operation extensions before their hooks unwind.
+                        execution_context.result = pre_execution_result
+                        return pre_execution_result
 
-                        if isawaitable(result):
-                            result = cast("Awaitable[GraphQLExecutionResult]", result)
-                            ensure_future(result).cancel()
-                            raise RuntimeError(  # noqa: TRY301
-                                "GraphQL execution failed to complete synchronously."
+                    assert execution_context.graphql_document is not None
+                    with extensions_runner.executing():
+                        if not execution_context.result:
+                            result = execute_function(
+                                self._schema,
+                                execution_context.graphql_document,
+                                root_value=execution_context.root_value,
+                                middleware=middleware_manager,
+                                variable_values=execution_context.variables,
+                                operation_name=execution_context.operation_name,
+                                context_value=execution_context.context,
+                                is_awaitable=optimized_is_awaitable,
+                                **execution_context_class_kwargs(
+                                    self.execution_context_class
+                                ),
+                                **custom_context_kwargs,
                             )
 
-                        # Subsequent incremental payloads can only be consumed
-                        # asynchronously, so `@defer`/`@stream` can't be honoured.
-                        if isinstance(result, GraphQLIncrementalExecutionResults):
-                            raise GraphQLError(  # noqa: TRY301
-                                "Incremental delivery (@defer and @stream) is not "
-                                "supported with synchronous execution, use "
-                                "`Schema.execute` instead."
-                            )
+                            if isawaitable(result):
+                                result = cast(
+                                    "Awaitable[GraphQLExecutionResult]", result
+                                )
+                                ensure_future(result).cancel()
+                                raise RuntimeError(  # noqa: TRY301
+                                    "GraphQL execution failed to complete synchronously."
+                                )
 
-                        result = cast("GraphQLExecutionResult", result)
-                        execution_context.result = result
-                        # Also set errors on the context so that it's easier
-                        # to access in extensions
-                        if result.errors:
-                            execution_context.pre_execution_errors = result.errors
+                            # Subsequent incremental payloads can only be consumed
+                            # asynchronously, so `@defer`/`@stream` can't be honoured.
+                            if isinstance(result, GraphQLIncrementalExecutionResults):
+                                raise GraphQLError(  # noqa: TRY301
+                                    "Incremental delivery (@defer and @stream) is not "
+                                    "supported with synchronous execution, use "
+                                    "`Schema.execute` instead."
+                                )
 
-                            # Run the `Schema.process_errors` function here before
-                            # extensions have a chance to modify them (see the MaskErrors
-                            # extension). That way we can log the original errors but
-                            # only return a sanitised version to the client.
-                            self._process_errors(result.errors, execution_context)
+                            result = cast("GraphQLExecutionResult", result)
+                            execution_context.result = result
+                            # Also set errors on the context so that it's easier
+                            # to access in extensions
+                            if result.errors:
+                                execution_context.pre_execution_errors = result.errors
+
+                                # Run the `Schema.process_errors` function here before
+                                # extensions have a chance to modify them (see the MaskErrors
+                                # extension). That way we can log the original errors but
+                                # only return a sanitised version to the client.
+                                self._process_errors(result.errors, execution_context)
+                except (
+                    MissingQueryError,
+                    CannotGetOperationTypeError,
+                    InvalidOperationTypeError,
+                ):
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # Handle the error before the operation hooks unwind, so that
+                    # extensions like MaskErrors can process the result
+                    errors = [_coerce_error(exc)]
+                    execution_context.pre_execution_errors = errors
+                    self._process_errors(errors, execution_context)
+                    execution_context.result = ExecutionResult(data=None, errors=errors)
         except (
             MissingQueryError,
             CannotGetOperationTypeError,
